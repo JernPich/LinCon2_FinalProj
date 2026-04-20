@@ -1,0 +1,1254 @@
+import math
+import copy
+import random
+from collections import deque
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+FILE_PATH = "Load_Temp_control_proof_56days.csv"
+
+DATETIME_COL = "datetime"
+TOUT_COL = "temp"
+PRICE_COL = "P_clear"
+
+# เน้น cost มากกว่า comfort แต่ยังรักษาความสบายไว้บ้าง
+ALPHA_LIST = [0.4, 0.5, 0.6, 0.65, 0.7]
+DEBUG_ALPHAS = [0.4, 0.6, 0.7]
+
+SEED = 42
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# 42 วัน train + 14 วัน test
+TRAIN_DAYS = 42
+TEST_DAYS = 14
+HOURS_PER_DAY = 24
+TRAIN_LEN = TRAIN_DAYS * HOURS_PER_DAY
+TEST_LEN = TEST_DAYS * HOURS_PER_DAY
+
+# episode = 1 week
+EPISODE_LEN = 24 * 7
+DT_HOURS = 1.0
+
+# temperature & action range
+T_MIN = 66.0
+T_MAX = 86.0
+ACTION_MAX_DELTA = 2.0
+
+# HVAC / thermal dynamics
+HVAC_POWER_KW_MAX = 5.0
+HVAC_COOLING_GAIN = 12.5
+ENVELOPE_GAIN = 0.05
+THERMAL_MASS = 10.0
+INTERNAL_GAIN_DAY = 0.28
+INTERNAL_GAIN_NIGHT = 0.05
+PROCESS_NOISE_STD = 0.01
+HVAC_CONTROL_BAND = 1.8
+
+# price-responsive setpoint
+SIGMA_FLOOR = 0.20
+T_RANGE_ALLOWED = 6.0
+K_BID = 3.0
+
+# reward
+ACTION_MAG_PENALTY = 0.04
+ACTION_CHANGE_PENALTY = 0.03
+POWER_RAMP_PENALTY = 0.005
+TRACKING_PENALTY = 0.0005
+BOUNDARY_PENALTY = 0.03
+K_COMFORT = 0.25
+
+# DDPG
+TRAIN_EPISODES = 500
+BATCH_SIZE = 128
+BUFFER_SIZE = 200_000
+GAMMA = 0.99
+TAU = 0.005
+ACTOR_LR = 3e-5
+CRITIC_LR = 2e-4
+WARMUP_STEPS = 8000
+
+# exploration
+OU_THETA = 0.15
+OU_SIGMA_START = 0.8
+OU_SIGMA_END = 0.1
+
+
+# =========================================================
+# REPRODUCIBILITY
+# =========================================================
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+
+# =========================================================
+# DATA PREP
+# =========================================================
+df = pd.read_csv(FILE_PATH)
+df[DATETIME_COL] = pd.to_datetime(df[DATETIME_COL])
+df = df.sort_values(DATETIME_COL).reset_index(drop=True)
+
+required = [DATETIME_COL, PRICE_COL, TOUT_COL]
+for c in required:
+    if c not in df.columns:
+        raise ValueError(f"Missing required column: {c}")
+
+# keep only 56 days if longer
+needed_rows = TRAIN_LEN + TEST_LEN
+if len(df) < needed_rows:
+    raise ValueError(f"Need at least {needed_rows} rows, but found {len(df)}.")
+df = df.iloc[:needed_rows].copy().reset_index(drop=True)
+
+# convert outdoor temp to Fahrenheit
+if df[TOUT_COL].mean() > 150:
+    # Kelvin -> F
+    df["T_out_F"] = (df[TOUT_COL] - 273.15) * 9 / 5 + 32
+elif df[TOUT_COL].mean() < 60:
+    # Celsius -> F
+    df["T_out_F"] = df[TOUT_COL] * 9.0 / 5.0 + 32.0
+else:
+    # already F
+    df["T_out_F"] = df[TOUT_COL].astype(float)
+
+df["hour"] = df[DATETIME_COL].dt.hour
+df["dow"] = df[DATETIME_COL].dt.dayofweek
+
+def base_schedule_from_hour(hour: int) -> float:
+    if 0 <= hour < 6:
+        return 74.0
+    if 6 <= hour < 9:
+        return 72.0
+    if 9 <= hour < 17:
+        return 76.0
+    if 17 <= hour < 22:
+        return 72.0
+    return 74.0
+
+if "T_schedule_base_F" not in df.columns:
+    df["T_schedule_base_F"] = df["hour"].apply(base_schedule_from_hour)
+else:
+    # unify name used later
+    df["T_schedule_base_F"] = df["T_schedule_base_F"].astype(float)
+
+# rolling price stats if missing
+price = df[PRICE_COL].astype(float)
+
+if "P_average_24h" not in df.columns:
+    df["P_average_24h"] = price.shift(1).rolling(24, min_periods=1).mean()
+    df.loc[df.index[0], "P_average_24h"] = price.iloc[0]
+    df["P_average_24h"] = df["P_average_24h"].ffill()
+
+if "sigma_actual_24h" not in df.columns:
+    std_24 = price.shift(1).rolling(24, min_periods=2).std()
+    std_med = std_24.median()
+    if pd.isna(std_med):
+        std_med = SIGMA_FLOOR
+    df["sigma_actual_24h"] = std_24.fillna(std_med).clip(lower=SIGMA_FLOOR)
+
+if "P_clear_z_24h" not in df.columns:
+    df["P_clear_z_24h"] = (
+        (df[PRICE_COL] - df["P_average_24h"]) / df["sigma_actual_24h"]
+    ).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+train_df = df.iloc[:TRAIN_LEN].copy().reset_index(drop=True)
+test_df = df.iloc[TRAIN_LEN:TRAIN_LEN + TEST_LEN].copy().reset_index(drop=True)
+
+print("train_df:", train_df.shape, train_df[DATETIME_COL].min(), train_df[DATETIME_COL].max())
+print("test_df :", test_df.shape, test_df[DATETIME_COL].min(), test_df[DATETIME_COL].max())
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def clamp(x, lo, hi):
+    return float(np.minimum(np.maximum(x, lo), hi))
+
+def occupied_gain(hour: int) -> float:
+    return INTERNAL_GAIN_DAY if 7 <= hour < 22 else INTERNAL_GAIN_NIGHT
+
+def compute_setpoint(T_schedule, P_clear, P_avg, sigma_actual, alpha):
+    sigma = max(float(sigma_actual), SIGMA_FLOOR)
+
+    # alpha ต่ำ -> price response อ่อน -> comfort มากกว่า
+    # alpha สูง -> price response แรง -> ประหยัดมากกว่า
+    alpha_gain = 0.6 + 1.4 * alpha   # 0.4 -> 1.16, 0.7 -> 1.58
+
+    delta = alpha_gain * ((P_clear - P_avg) * T_RANGE_ALLOWED) / (K_BID * sigma)
+    T_set = T_schedule + delta
+    return clamp(T_set, T_MIN, T_MAX)
+
+def hvac_power_fraction(T_room, T_set, prev_power_frac):
+    error = T_room - T_set
+    raw = error / HVAC_CONTROL_BAND
+    raw = clamp(raw, 0.0, 1.0)
+
+    # smoother response
+    power_frac = 0.6 * prev_power_frac + 0.4 * raw
+    return clamp(power_frac, 0.0, 1.0)
+
+def thermal_step_cooling(T_room, T_out, power_frac, hour, dt_hours=1.0):
+    env_term = ENVELOPE_GAIN * (T_out - T_room)
+    int_term = occupied_gain(hour)
+    cool_term = HVAC_COOLING_GAIN * power_frac
+    noise = np.random.normal(0.0, PROCESS_NOISE_STD)
+
+    dT = dt_hours * (env_term + int_term - cool_term) / THERMAL_MASS
+    T_next = T_room + dT + noise
+    return clamp(T_next, T_MIN, T_MAX)
+
+def normalize_state_vector(
+    T_set,
+    T_room,
+    T_schedule_base,
+    T_schedule_applied,
+    T_out,
+    P_clear,
+    P_avg,
+    P_std,
+    hour_sin,
+    hour_cos,
+    prev_action,
+    prev_power_frac,
+    alpha,
+):
+    return np.array([
+        (T_set - 75.0) / 10.0,
+        (T_room - 75.0) / 10.0,
+        (T_schedule_base - 75.0) / 10.0,
+        (T_schedule_applied - 75.0) / 10.0,
+        (T_out - 75.0) / 15.0,
+        (P_clear - train_df[PRICE_COL].mean()) / max(train_df[PRICE_COL].std(), 1e-6),
+        (P_avg - train_df["P_average_24h"].mean()) / max(train_df["P_average_24h"].std(), 1e-6),
+        (P_std - train_df["sigma_actual_24h"].mean()) / max(train_df["sigma_actual_24h"].std(), 1e-6),
+        hour_sin,
+        hour_cos,
+        prev_action / ACTION_MAX_DELTA,
+        prev_power_frac,
+        alpha,
+    ], dtype=np.float32)
+
+def reward_fn(
+    E_hvac_kwh,
+    P_clear,
+    T_room,
+    T_schedule_base,
+    T_schedule_current,
+    alpha,
+    action,
+    prev_action,
+    power_frac,
+    prev_power_frac,
+):
+    energy_cost = E_hvac_kwh * P_clear
+    T_dev = T_room - T_schedule_base
+
+    # normalize cost ให้ขนาดใกล้กับ comfort
+    cost_norm = energy_cost / 8.0
+
+    # alpha ต่ำ -> comfort penalty แรงขึ้น
+    # alpha สูง -> comfort penalty เบาลง
+    comfort_weight = (1.0 - alpha) * (2.8 - 1.5 * alpha)
+
+    comfort_term = comfort_weight * (T_dev / 2.0) ** 2
+
+    reward = -alpha * cost_norm - comfort_term
+
+    # stabilization
+    reward -= 0.015 * (action / ACTION_MAX_DELTA) ** 2
+    reward -= 0.01 * ((action - prev_action) / ACTION_MAX_DELTA) ** 2
+    reward -= 0.003 * (power_frac - prev_power_frac) ** 2
+    reward -= 0.001 * (T_room - T_schedule_current) ** 2
+
+    if abs(action) > 0.95 * ACTION_MAX_DELTA:
+        reward -= 0.02
+
+    return reward
+
+
+# =========================================================
+# ENVIRONMENT
+# =========================================================
+class HVACEnv:
+    def __init__(self, data: pd.DataFrame, alpha: float, episode_len: int = EPISODE_LEN, dt_hours: float = DT_HOURS):
+        self.data = data.reset_index(drop=True)
+        self.alpha = float(alpha)
+        self.episode_len = min(int(episode_len), len(self.data) - 2)
+        self.dt_hours = float(dt_hours)
+        self.max_start = len(self.data) - self.episode_len - 1
+        if self.max_start < 1:
+            raise ValueError("Dataset too short for chosen episode_len")
+        self.reset()
+
+    @property
+    def state_dim(self):
+        return 13
+
+    @property
+    def action_dim(self):
+        return 1
+
+    def _build_state(self):
+        row = self.data.iloc[self.idx]
+        hour = float(row["hour"])
+        hour_sin = math.sin(2.0 * math.pi * hour / 24.0)
+        hour_cos = math.cos(2.0 * math.pi * hour / 24.0)
+
+        T_schedule_base = float(row["T_schedule_base_F"])
+        P_clear = float(row[PRICE_COL])
+        P_avg = float(row["P_average_24h"])
+        P_std = float(row["sigma_actual_24h"])
+        T_out = float(row["T_out_F"])
+
+        T_set = compute_setpoint(
+            T_schedule=self.current_schedule,
+            P_clear=P_clear,
+            P_avg=P_avg,
+            sigma_actual=P_std,
+            alpha=self.alpha,
+        )
+
+        return normalize_state_vector(
+            T_set=T_set,
+            T_room=self.T_room,
+            T_schedule_base=T_schedule_base,
+            T_schedule_applied=self.current_schedule,
+            T_out=T_out,
+            P_clear=P_clear,
+            P_avg=P_avg,
+            P_std=P_std,
+            hour_sin=hour_sin,
+            hour_cos=hour_cos,
+            prev_action=self.prev_action,
+            prev_power_frac=self.prev_power_frac,
+            alpha=self.alpha,
+        )
+
+    def reset(self, start_idx=None):
+        if start_idx is None:
+            start_idx = np.random.randint(0, self.max_start)
+
+        self.start_idx = int(start_idx)
+        self.idx = int(start_idx)
+        self.step_count = 0
+        self.prev_action = 0.0
+        self.prev_power_frac = 0.0
+
+        row = self.data.iloc[self.idx]
+        self.T_room = float(row["T_schedule_base_F"]) + np.random.uniform(-1.0, 1.0)
+        self.current_schedule = float(row["T_schedule_base_F"])
+        self.done = False
+        self.history = []
+
+        return self._build_state()
+
+    def step(self, action):
+        if self.done:
+            raise RuntimeError("Episode finished. Call reset().")
+
+        row = self.data.iloc[self.idx]
+        hour = int(row["hour"])
+        T_schedule_base = float(row["T_schedule_base_F"])
+        T_out = float(row["T_out_F"])
+        P_clear = float(row[PRICE_COL])
+        P_avg = float(row["P_average_24h"])
+        P_std = float(row["sigma_actual_24h"])
+
+        action = float(np.clip(action, -ACTION_MAX_DELTA, ACTION_MAX_DELTA))
+        prev_action_before_update = self.prev_action
+        prev_power_before_update = self.prev_power_frac
+
+        target_schedule = clamp(T_schedule_base + action, T_MIN, T_MAX)
+
+        self.current_schedule = (
+            0.55 * self.current_schedule
+            + 0.45 * target_schedule
+        )
+        self.current_schedule = clamp(self.current_schedule, T_MIN, T_MAX)
+
+        T_set = compute_setpoint(
+            T_schedule=self.current_schedule,
+            P_clear=P_clear,
+            P_avg=P_avg,
+            sigma_actual=P_std,
+            alpha=self.alpha,
+        )
+
+        power_frac = hvac_power_fraction(
+            T_room=self.T_room,
+            T_set=T_set,
+            prev_power_frac=prev_power_before_update,
+        )
+
+        E_hvac = HVAC_POWER_KW_MAX * power_frac * self.dt_hours
+        hourly_cost = E_hvac * P_clear
+        T_dev = self.T_room - T_schedule_base
+
+        reward = reward_fn(
+            E_hvac_kwh=E_hvac,
+            P_clear=P_clear,
+            T_room=self.T_room,
+            T_schedule_base=T_schedule_base,
+            T_schedule_current=self.current_schedule,
+            alpha=self.alpha,
+            action=action,
+            prev_action=prev_action_before_update,
+            power_frac=power_frac,
+            prev_power_frac=prev_power_before_update,
+        )
+
+        self.history.append({
+            DATETIME_COL: row[DATETIME_COL],
+            "T_room": self.T_room,
+            "T_schedule_base": T_schedule_base,
+            "T_schedule": self.current_schedule,
+            "T_set": T_set,
+            "power_frac": power_frac,
+            "hvac_on": 1 if power_frac > 1e-3 else 0,
+            "E_hvac_kwh": E_hvac,
+            "hourly_cost": hourly_cost,
+            "T_dev": T_dev,
+            "reward": reward,
+            "action_delta_schedule": action,
+            PRICE_COL: P_clear,
+            "T_out_F": T_out,
+        })
+
+        self.T_room = thermal_step_cooling(
+            T_room=self.T_room,
+            T_out=T_out,
+            power_frac=power_frac,
+            hour=hour,
+            dt_hours=self.dt_hours,
+        )
+
+        self.prev_action = action
+        self.prev_power_frac = power_frac
+        self.idx += 1
+        self.step_count += 1
+        self.done = (self.step_count >= self.episode_len) or (self.idx >= len(self.data) - 1)
+
+        next_state = self._build_state() if not self.done else np.zeros(self.state_dim, dtype=np.float32)
+        return next_state, reward, self.done, {}
+
+    def rollout_dataframe(self):
+        return pd.DataFrame(self.history)
+
+
+# =========================================================
+# BASELINE
+# =========================================================
+def simulate_baseline(data: pd.DataFrame, alpha: float, start_idx: int, episode_len: int):
+    env = HVACEnv(data, alpha=alpha, episode_len=episode_len, dt_hours=DT_HOURS)
+    _ = env.reset(start_idx=start_idx)
+    done = False
+    while not done:
+        _, _, done, _ = env.step(0.0)
+    return env.rollout_dataframe()
+
+
+# =========================================================
+# OU NOISE
+# =========================================================
+class OUNoise:
+    def __init__(self, size, theta=0.15, sigma=0.2, dt=1.0):
+        self.size = size
+        self.theta = theta
+        self.sigma = sigma
+        self.dt = dt
+        self.state = np.zeros(self.size, dtype=np.float32)
+
+    def reset(self):
+        self.state = np.zeros(self.size, dtype=np.float32)
+
+    def sample(self):
+        dx = self.theta * (-self.state) * self.dt + self.sigma * np.sqrt(self.dt) * np.random.randn(self.size)
+        self.state = self.state + dx
+        return self.state.copy()
+
+
+# =========================================================
+# REPLAY BUFFER
+# =========================================================
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        self.buffer = deque(maxlen=capacity)
+
+    def add(self, s, a, r, ns, d):
+        self.buffer.append((s, a, r, ns, d))
+
+    def sample(self, batch_size: int):
+        batch = random.sample(self.buffer, batch_size)
+        s, a, r, ns, d = zip(*batch)
+        return (
+            torch.tensor(np.array(s), dtype=torch.float32, device=DEVICE),
+            torch.tensor(np.array(a), dtype=torch.float32, device=DEVICE),
+            torch.tensor(np.array(r), dtype=torch.float32, device=DEVICE).unsqueeze(1),
+            torch.tensor(np.array(ns), dtype=torch.float32, device=DEVICE),
+            torch.tensor(np.array(d), dtype=torch.float32, device=DEVICE).unsqueeze(1),
+        )
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# =========================================================
+# NETWORKS
+# =========================================================
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, action_limit):
+        super().__init__()
+        self.action_limit = action_limit
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim),
+            nn.Tanh(),
+        )
+
+    def forward(self, x):
+        return self.net(x) * self.action_limit
+
+
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, s, a):
+        x = torch.cat([s, a], dim=1)
+        return self.net(x)
+
+
+# =========================================================
+# DDPG AGENT
+# =========================================================
+class DDPGAgent:
+    def __init__(self, state_dim, action_dim, action_limit):
+        self.actor = Actor(state_dim, action_dim, action_limit).to(DEVICE)
+        self.actor_target = Actor(state_dim, action_dim, action_limit).to(DEVICE)
+        self.critic = Critic(state_dim, action_dim).to(DEVICE)
+        self.critic_target = Critic(state_dim, action_dim).to(DEVICE)
+
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target.load_state_dict(self.critic.state_dict())
+
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=ACTOR_LR)
+        self.critic_opt = optim.Adam(self.critic.parameters(), lr=CRITIC_LR)
+        self.action_limit = action_limit
+        self.update_step = 0
+
+    def select_action(self, state, noise=None):
+        s = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        with torch.no_grad():
+            a = self.actor(s).cpu().numpy()[0]
+        if noise is not None:
+            a = a + noise
+        return np.clip(a, -self.action_limit, self.action_limit)
+
+    def train_step(self, replay: ReplayBuffer, batch_size: int):
+        if len(replay) < batch_size:
+            return None
+
+        self.update_step += 1
+        s, a, r, ns, d = replay.sample(batch_size)
+
+        with torch.no_grad():
+            next_a = self.actor_target(ns)
+            next_q = self.critic_target(ns, next_a)
+            target_q = r + GAMMA * (1.0 - d) * next_q
+
+        current_q = self.critic(s, a)
+        critic_loss = nn.MSELoss()(current_q, target_q)
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        self.critic_opt.step()
+
+        actor_loss_val = None
+        # delayed actor update
+        if self.update_step % 2 == 0:
+            pred_a = self.actor(s)
+            actor_q = self.critic(s, pred_a).mean()
+            action_reg = 0.02 * (pred_a / self.action_limit).pow(2).mean()
+            actor_loss = -actor_q + action_reg
+
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            self.actor_opt.step()
+
+            self.soft_update(self.actor, self.actor_target)
+            self.soft_update(self.critic, self.critic_target)
+            actor_loss_val = float(actor_loss.item())
+        else:
+            self.soft_update(self.critic, self.critic_target)
+
+        return {
+            "critic_loss": float(critic_loss.item()),
+            "actor_loss": actor_loss_val,
+        }
+
+    @staticmethod
+    def soft_update(src, tgt):
+        for src_p, tgt_p in zip(src.parameters(), tgt.parameters()):
+            tgt_p.data.copy_(TAU * src_p.data + (1.0 - TAU) * tgt_p.data)
+
+
+# =========================================================
+# VALIDATION SCORE
+# =========================================================
+def validation_score(sim_df: pd.DataFrame):
+    # เน้น cost ก่อน comfort
+    return -(1.0 * sim_df["hourly_cost"].mean() + 0.8 * sim_df["T_dev"].abs().mean())
+
+
+# =========================================================
+# TRAINING
+# =========================================================
+def train_ddpg_for_alpha(data: pd.DataFrame, alpha: float):
+    split_idx = int(len(data) * 0.8)
+    train_part = data.iloc[:split_idx].reset_index(drop=True)
+    val_part = data.iloc[split_idx:].reset_index(drop=True)
+
+    env = HVACEnv(train_part, alpha=alpha, episode_len=EPISODE_LEN, dt_hours=DT_HOURS)
+    agent = DDPGAgent(env.state_dim, env.action_dim, ACTION_MAX_DELTA)
+    replay = ReplayBuffer(BUFFER_SIZE)
+
+    reward_history = []
+    loss_history = []
+    global_step = 0
+
+    best_score = -np.inf
+    best_actor_state = None
+    best_critic_state = None
+
+    ou = OUNoise(size=env.action_dim, theta=OU_THETA, sigma=OU_SIGMA_START)
+
+    for ep in range(TRAIN_EPISODES):
+        state = env.reset()
+        ou.reset()
+
+        frac = ep / max(TRAIN_EPISODES - 1, 1)
+        sigma_now = OU_SIGMA_START + frac * (OU_SIGMA_END - OU_SIGMA_START)
+        ou.sigma = sigma_now
+
+        done = False
+        ep_reward = 0.0
+
+        while not done:
+            if global_step < WARMUP_STEPS:
+                action = np.random.uniform(-ACTION_MAX_DELTA, ACTION_MAX_DELTA, size=(1,))
+            else:
+                noise = ou.sample()
+                action = agent.select_action(state, noise=noise)
+
+            next_state, reward, done, _ = env.step(action[0])
+            replay.add(state, action, reward, next_state, done)
+
+            state = next_state
+            ep_reward += reward
+            global_step += 1
+
+            losses = agent.train_step(replay, BATCH_SIZE)
+            if losses is not None:
+                loss_history.append(losses)
+
+        reward_history.append(ep_reward)
+
+        if (ep + 1) % 10 == 0:
+            val_env = HVACEnv(val_part, alpha=alpha, episode_len=min(EPISODE_LEN, len(val_part) - 2), dt_hours=DT_HOURS)
+            state = val_env.reset(start_idx=0)
+            done = False
+            while not done:
+                action = agent.select_action(state, noise=None)
+                state, _, done, _ = val_env.step(action[0])
+
+            val_sim = val_env.rollout_dataframe()
+            score = validation_score(val_sim)
+
+            if score > best_score:
+                best_score = score
+                best_actor_state = copy.deepcopy(agent.actor.state_dict())
+                best_critic_state = copy.deepcopy(agent.critic.state_dict())
+
+            print(
+                f"alpha={alpha:.2f} "
+                f"episode={ep+1}/{TRAIN_EPISODES} "
+                f"reward={ep_reward:.2f} "
+                f"val_score={score:.4f} "
+                f"best_score={best_score:.4f} "
+                f"ou_sigma={sigma_now:.3f}"
+            )
+
+    if best_actor_state is not None:
+        agent.actor.load_state_dict(best_actor_state)
+        agent.critic.load_state_dict(best_critic_state)
+
+    return agent, reward_history, loss_history
+
+
+# =========================================================
+# EVALUATION
+# =========================================================
+def simulate_trained_policy(data: pd.DataFrame, alpha: float, agent: DDPGAgent, start_idx: int, episode_len: int):
+    env = HVACEnv(data, alpha=alpha, episode_len=episode_len, dt_hours=DT_HOURS)
+    state = env.reset(start_idx=start_idx)
+    done = False
+
+    while not done:
+        action = agent.select_action(state, noise=None)
+        next_state, reward, done, _ = env.step(action[0])
+        state = next_state
+
+    return env.rollout_dataframe()
+
+
+# =========================================================
+# METRICS
+# =========================================================
+def weekly_bill(df_sim):
+    tmp = df_sim.copy()
+    tmp["week_start"] = pd.to_datetime(tmp[DATETIME_COL]).dt.to_period("W").apply(lambda r: r.start_time)
+    return (
+        tmp.groupby("week_start", as_index=False)["hourly_cost"]
+        .sum()
+        .rename(columns={"hourly_cost": "weekly_bill"})
+    )
+
+def weekly_energy(df_sim):
+    tmp = df_sim.copy()
+    tmp["week_start"] = pd.to_datetime(tmp[DATETIME_COL]).dt.to_period("W").apply(lambda r: r.start_time)
+    return (
+        tmp.groupby("week_start", as_index=False)["E_hvac_kwh"]
+        .sum()
+        .rename(columns={"E_hvac_kwh": "weekly_energy"})
+    )
+
+def weekly_temp_dev(df_sim):
+    tmp = df_sim.copy()
+    tmp["week_start"] = pd.to_datetime(tmp[DATETIME_COL]).dt.to_period("W").apply(lambda r: r.start_time)
+    return (
+        tmp.groupby("week_start")["T_dev"]
+        .agg(avg_temp_dev=lambda s: np.abs(s).mean())
+        .reset_index()
+    )
+
+def rollout_metrics(df_sim):
+    return {
+        "mean_action": float(df_sim["action_delta_schedule"].mean()),
+        "std_action": float(df_sim["action_delta_schedule"].std()),
+        "mean_power_frac": float(df_sim["power_frac"].mean()),
+        "mean_hourly_cost": float(df_sim["hourly_cost"].mean()),
+        "mean_hourly_energy": float(df_sim["E_hvac_kwh"].mean()),
+        "mean_abs_tdev": float(df_sim["T_dev"].abs().mean()),
+    }
+
+
+# =========================================================
+# WEEKLY WINDOWS ON TEST SET
+# =========================================================
+def get_weekly_start_indices(data: pd.DataFrame, episode_len: int):
+    starts = []
+    for i in range(0, len(data) - episode_len - 1, episode_len):
+        starts.append(i)
+    return starts
+
+weekly_starts = get_weekly_start_indices(test_df, EPISODE_LEN)
+
+
+# =========================================================
+# TRAIN + EVAL ALL ALPHAS
+# =========================================================
+bill_records = []
+energy_records = []
+dev_records = []
+sample_runs = {}
+train_logs = {}
+diagnostics = []
+summary_rows = []
+
+for alpha in ALPHA_LIST:
+    print(f"\n========== TRAINING alpha={alpha:.2f} ==========")
+    agent, reward_hist, loss_hist = train_ddpg_for_alpha(train_df, alpha)
+
+    train_logs[alpha] = {
+        "reward_hist": reward_hist,
+        "loss_hist": loss_hist,
+        "agent": agent,
+    }
+
+    alpha_diag_rows = []
+
+    for wi, start_idx in enumerate(weekly_starts):
+        sim_base = simulate_baseline(test_df, alpha=alpha, start_idx=start_idx, episode_len=EPISODE_LEN)
+        sim_rl = simulate_trained_policy(test_df, alpha=alpha, agent=agent, start_idx=start_idx, episode_len=EPISODE_LEN)
+
+        if wi == 0 and alpha in DEBUG_ALPHAS:
+            sample_runs[("baseline", alpha)] = sim_base.copy()
+            sample_runs[("policy", alpha)] = sim_rl.copy()
+
+        wb_base = weekly_bill(sim_base)
+        wb_base["alpha"] = alpha
+        wb_base["Method"] = "Without RL agent"
+
+        wb_rl = weekly_bill(sim_rl)
+        wb_rl["alpha"] = alpha
+        wb_rl["Method"] = "With RL agent"
+
+        we_base = weekly_energy(sim_base)
+        we_base["alpha"] = alpha
+        we_base["Method"] = "Without RL agent"
+
+        we_rl = weekly_energy(sim_rl)
+        we_rl["alpha"] = alpha
+        we_rl["Method"] = "With RL agent"
+
+        td_base = weekly_temp_dev(sim_base)
+        td_base["alpha"] = alpha
+        td_base["Method"] = "Without RL agent"
+
+        td_rl = weekly_temp_dev(sim_rl)
+        td_rl["alpha"] = alpha
+        td_rl["Method"] = "With RL agent"
+
+        bill_records.append(wb_base[["alpha", "Method", "weekly_bill"]])
+        bill_records.append(wb_rl[["alpha", "Method", "weekly_bill"]])
+
+        energy_records.append(we_base[["alpha", "Method", "weekly_energy"]])
+        energy_records.append(we_rl[["alpha", "Method", "weekly_energy"]])
+
+        dev_records.append(td_base[["alpha", "Method", "avg_temp_dev"]])
+        dev_records.append(td_rl[["alpha", "Method", "avg_temp_dev"]])
+
+        base_m = rollout_metrics(sim_base)
+        rl_m = rollout_metrics(sim_rl)
+
+        alpha_diag_rows.append({
+            "alpha": alpha,
+            "week_id": wi,
+            "base_mean_power_frac": base_m["mean_power_frac"],
+            "rl_mean_power_frac": rl_m["mean_power_frac"],
+            "base_mean_hourly_cost": base_m["mean_hourly_cost"],
+            "rl_mean_hourly_cost": rl_m["mean_hourly_cost"],
+            "base_mean_hourly_energy": base_m["mean_hourly_energy"],
+            "rl_mean_hourly_energy": rl_m["mean_hourly_energy"],
+            "base_mean_abs_tdev": base_m["mean_abs_tdev"],
+            "rl_mean_abs_tdev": rl_m["mean_abs_tdev"],
+            "rl_mean_action": rl_m["mean_action"],
+            "rl_std_action": rl_m["std_action"],
+        })
+
+    diagnostics.extend(alpha_diag_rows)
+
+bill_df = pd.concat(bill_records, ignore_index=True)
+energy_df = pd.concat(energy_records, ignore_index=True)
+dev_df = pd.concat(dev_records, ignore_index=True)
+diag_df = pd.DataFrame(diagnostics)
+
+for alpha in ALPHA_LIST:
+    cost_with = bill_df[(bill_df["alpha"] == alpha) & (bill_df["Method"] == "With RL agent")]["weekly_bill"].mean()
+    cost_without = bill_df[(bill_df["alpha"] == alpha) & (bill_df["Method"] == "Without RL agent")]["weekly_bill"].mean()
+
+    energy_with = energy_df[(energy_df["alpha"] == alpha) & (energy_df["Method"] == "With RL agent")]["weekly_energy"].mean()
+    energy_without = energy_df[(energy_df["alpha"] == alpha) & (energy_df["Method"] == "Without RL agent")]["weekly_energy"].mean()
+
+    dev_with = dev_df[(dev_df["alpha"] == alpha) & (dev_df["Method"] == "With RL agent")]["avg_temp_dev"].mean()
+    dev_without = dev_df[(dev_df["alpha"] == alpha) & (dev_df["Method"] == "Without RL agent")]["avg_temp_dev"].mean()
+
+    csf = (cost_without - cost_with) / cost_without * 100 if cost_without != 0 else np.nan
+    esf = (energy_without - energy_with) / energy_without * 100 if energy_without != 0 else np.nan
+    tif = (dev_without - dev_with) / dev_without * 100 if dev_without != 0 else np.nan
+
+    summary_rows.append({
+        "alpha": alpha,
+        "weekly_bill_without_rl": cost_without,
+        "weekly_bill_with_rl": cost_with,
+        "CSF_%": csf,
+        "weekly_energy_without_rl": energy_without,
+        "weekly_energy_with_rl": energy_with,
+        "ESF_%": esf,
+        "temp_dev_without_rl": dev_without,
+        "temp_dev_with_rl": dev_with,
+        "TIF_%": tif,
+    })
+
+summary_df = pd.DataFrame(summary_rows)
+
+print("\n===== DIAGNOSTIC MEANS BY ALPHA =====")
+print(
+    diag_df.groupby("alpha", as_index=False)[
+        [
+            "base_mean_power_frac",
+            "rl_mean_power_frac",
+            "base_mean_hourly_cost",
+            "rl_mean_hourly_cost",
+            "base_mean_hourly_energy",
+            "rl_mean_hourly_energy",
+            "base_mean_abs_tdev",
+            "rl_mean_abs_tdev",
+            "rl_mean_action",
+            "rl_std_action",
+        ]
+    ]
+    .mean()
+    .round(3)
+)
+
+print("\n===== SUMMARY =====")
+print(summary_df.round(3))
+
+
+# =========================================================
+# PLOTS
+# =========================================================
+
+# Plot 1: Episode reward during training
+fig, ax = plt.subplots(figsize=(10, 5))
+for alpha in DEBUG_ALPHAS:
+    if alpha in train_logs:
+        ax.plot(train_logs[alpha]["reward_hist"], label=f"alpha={alpha}")
+ax.set_title("Episode reward during training")
+ax.set_xlabel("Episode")
+ax.set_ylabel("Reward")
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# Plot 2: Weekly electricity cost
+x = np.arange(len(ALPHA_LIST))
+width = 0.35
+
+data_with = [
+    bill_df[(bill_df["alpha"] == a) & (bill_df["Method"] == "With RL agent")]["weekly_bill"].values
+    for a in ALPHA_LIST
+]
+data_without = [
+    bill_df[(bill_df["alpha"] == a) & (bill_df["Method"] == "Without RL agent")]["weekly_bill"].values
+    for a in ALPHA_LIST
+]
+
+pos_with = x - width / 2
+pos_without = x + width / 2
+
+fig, ax = plt.subplots(figsize=(10, 6))
+bp1 = ax.boxplot(data_with, positions=pos_with, widths=0.28, patch_artist=True, manage_ticks=False)
+bp2 = ax.boxplot(data_without, positions=pos_without, widths=0.28, patch_artist=True, manage_ticks=False)
+
+for patch in bp1["boxes"]:
+    patch.set_facecolor("#4C72B0")
+    patch.set_alpha(0.85)
+for patch in bp2["boxes"]:
+    patch.set_facecolor("#DD8452")
+    patch.set_alpha(0.85)
+
+mean_with = [np.mean(d) if len(d) else np.nan for d in data_with]
+mean_without = [np.mean(d) if len(d) else np.nan for d in data_without]
+
+ax.plot(pos_with, mean_with, "g--", linewidth=1.5)
+ax.plot(pos_without, mean_without, "g--", linewidth=1.5)
+
+from matplotlib.patches import Patch
+ax.legend(
+    handles=[
+        Patch(facecolor="#4C72B0", label="With RL agent"),
+        Patch(facecolor="#DD8452", label="Without RL agent"),
+    ],
+    title="Method",
+    loc="lower center",
+)
+ax.set_xticks(x)
+ax.set_xticklabels(ALPHA_LIST)
+ax.set_xlabel("alpha")
+ax.set_ylabel("Electricity Bill (USD)")
+ax.set_title("Weekly Electricity Cost with different α")
+ax.grid(True, axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# Plot 3: Weekly HVAC energy usage
+data_with_e = [
+    energy_df[(energy_df["alpha"] == a) & (energy_df["Method"] == "With RL agent")]["weekly_energy"].values
+    for a in ALPHA_LIST
+]
+data_without_e = [
+    energy_df[(energy_df["alpha"] == a) & (energy_df["Method"] == "Without RL agent")]["weekly_energy"].values
+    for a in ALPHA_LIST
+]
+
+fig, ax = plt.subplots(figsize=(10, 6))
+bp1 = ax.boxplot(data_with_e, positions=pos_with, widths=0.28, patch_artist=True, manage_ticks=False)
+bp2 = ax.boxplot(data_without_e, positions=pos_without, widths=0.28, patch_artist=True, manage_ticks=False)
+
+for patch in bp1["boxes"]:
+    patch.set_facecolor("#4C72B0")
+    patch.set_alpha(0.85)
+for patch in bp2["boxes"]:
+    patch.set_facecolor("#DD8452")
+    patch.set_alpha(0.85)
+
+mean_with_e = [np.mean(d) if len(d) else np.nan for d in data_with_e]
+mean_without_e = [np.mean(d) if len(d) else np.nan for d in data_without_e]
+
+ax.plot(pos_with, mean_with_e, "g--", linewidth=1.5)
+ax.plot(pos_without, mean_without_e, "g--", linewidth=1.5)
+
+ax.legend(
+    handles=[
+        Patch(facecolor="#4C72B0", label="With RL agent"),
+        Patch(facecolor="#DD8452", label="Without RL agent"),
+    ],
+    title="Method",
+    loc="lower center",
+)
+ax.set_xticks(x)
+ax.set_xticklabels(ALPHA_LIST)
+ax.set_xlabel("alpha")
+ax.set_ylabel("Weekly HVAC Energy (kWh)")
+ax.set_title("Weekly HVAC Energy Usage with different α")
+ax.grid(True, axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# Plot 4: Average temperature deviation
+fig, ax = plt.subplots(figsize=(10, 6))
+
+data_with_dev = [
+    dev_df[(dev_df["alpha"] == a) & (dev_df["Method"] == "With RL agent")]["avg_temp_dev"].values
+    for a in ALPHA_LIST
+]
+data_without_dev = [
+    dev_df[(dev_df["alpha"] == a) & (dev_df["Method"] == "Without RL agent")]["avg_temp_dev"].values
+    for a in ALPHA_LIST
+]
+
+pos_with = x - width / 2
+pos_without = x + width / 2
+
+bp1 = ax.boxplot(
+    data_with_dev,
+    positions=pos_with,
+    widths=0.28,
+    patch_artist=True,
+    manage_ticks=False
+)
+bp2 = ax.boxplot(
+    data_without_dev,
+    positions=pos_without,
+    widths=0.28,
+    patch_artist=True,
+    manage_ticks=False
+)
+
+for patch in bp1["boxes"]:
+    patch.set_facecolor("#4C72B0")
+    patch.set_alpha(0.85)
+
+for patch in bp2["boxes"]:
+    patch.set_facecolor("#DD8452")
+    patch.set_alpha(0.85)
+
+mean_with_dev = [np.mean(d) if len(d) else np.nan for d in data_with_dev]
+mean_without_dev = [np.mean(d) if len(d) else np.nan for d in data_without_dev]
+
+ax.plot(pos_with, mean_with_dev, "g--", linewidth=1.5)
+ax.plot(pos_without, mean_without_dev, "g--", linewidth=1.5)
+
+from matplotlib.patches import Patch
+ax.legend(
+    handles=[
+        Patch(facecolor="#4C72B0", label="With RL agent"),
+        Patch(facecolor="#DD8452", label="Without RL agent"),
+    ],
+    title="Method",
+)
+
+ax.set_xticks(x)
+ax.set_xticklabels(ALPHA_LIST)
+ax.set_xlabel("alpha")
+ax.set_ylabel("Temperature Deviation from Schedule (°F)")
+ax.set_title("Weekly Temperature Deviation with different α")
+ax.grid(True, axis="y", alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+fig, ax = plt.subplots(figsize=(12, 4))
+
+for alpha, color in zip(DEBUG_ALPHAS, ["tab:green", "tab:purple", "tab:red"]):
+    simp = sample_runs[("policy", alpha)]
+    ax.plot(
+        pd.to_datetime(simp[DATETIME_COL]),
+        simp["T_dev"],
+        label=f"T_dev RL α={alpha}",
+        color=color
+    )
+
+ax.axhline(0, color="black", linestyle="--", linewidth=1)
+ax.set_title("Sample week: Temperature Deviation")
+ax.set_xlabel("Time")
+ax.set_ylabel("T_dev (°F)")
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# Plot 5: Sample week causal chain
+sample_alpha_list = DEBUG_ALPHAS
+first_alpha = sample_alpha_list[0]
+sample_df = sample_runs[("policy", first_alpha)]
+
+sample_start = pd.to_datetime(sample_df[DATETIME_COL]).min()
+sample_end = sample_start + pd.Timedelta(days=7)
+
+fig, axes = plt.subplots(4, 1, figsize=(13, 12), sharex=True)
+
+# 1) price
+for alpha, color in zip(sample_alpha_list, ["tab:green", "tab:purple", "tab:red"]):
+    simp = sample_runs[("policy", alpha)]
+    mask = (pd.to_datetime(simp[DATETIME_COL]) >= sample_start) & (pd.to_datetime(simp[DATETIME_COL]) < sample_end)
+    axes[0].plot(
+        pd.to_datetime(simp.loc[mask, DATETIME_COL]),
+        simp.loc[mask, PRICE_COL],
+        label=f"P_clear α={alpha}",
+        color=color
+    )
+
+axes[0].set_ylabel("Price")
+axes[0].set_title("Sample week: price")
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# 2) action
+for alpha, color in zip(sample_alpha_list, ["tab:green", "tab:purple", "tab:red"]):
+    simp = sample_runs[("policy", alpha)]
+    mask = (pd.to_datetime(simp[DATETIME_COL]) >= sample_start) & (pd.to_datetime(simp[DATETIME_COL]) < sample_end)
+    axes[1].plot(
+        pd.to_datetime(simp.loc[mask, DATETIME_COL]),
+        simp.loc[mask, "action_delta_schedule"],
+        label=f"action α={alpha}",
+        color=color
+    )
+
+axes[1].set_ylabel("Action")
+axes[1].set_title("Action delta schedule")
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+# 3) room temperature / schedule / setpoint
+for alpha, color in zip(sample_alpha_list, ["tab:green", "tab:purple", "tab:red"]):
+    simp = sample_runs[("policy", alpha)]
+    simb = sample_runs[("baseline", alpha)]
+
+    mask_p = (pd.to_datetime(simp[DATETIME_COL]) >= sample_start) & (pd.to_datetime(simp[DATETIME_COL]) < sample_end)
+    mask_b = (pd.to_datetime(simb[DATETIME_COL]) >= sample_start) & (pd.to_datetime(simb[DATETIME_COL]) < sample_end)
+
+    axes[2].plot(
+        pd.to_datetime(simp.loc[mask_p, DATETIME_COL]),
+        simp.loc[mask_p, "T_room"],
+        color=color,
+        label=f"T_room RL α={alpha}"
+    )
+    axes[2].plot(
+        pd.to_datetime(simp.loc[mask_p, DATETIME_COL]),
+        simp.loc[mask_p, "T_schedule"],
+        linestyle="--",
+        color=color,
+        alpha=0.9
+    )
+    axes[2].plot(
+        pd.to_datetime(simp.loc[mask_p, DATETIME_COL]),
+        simp.loc[mask_p, "T_set"],
+        linestyle=":",
+        color=color,
+        alpha=0.9
+    )
+    axes[2].plot(
+        pd.to_datetime(simb.loc[mask_b, DATETIME_COL]),
+        simb.loc[mask_b, "T_schedule"],
+        linestyle="-.",
+        color="gray",
+        alpha=0.5
+    )
+
+axes[2].set_ylabel("Temperature (°F)")
+axes[2].set_title("Room temperature, schedule, and setpoint")
+axes[2].legend(ncol=2, fontsize=8)
+axes[2].grid(True, alpha=0.3)
+
+# 4) HVAC power
+for alpha, color in zip(sample_alpha_list, ["tab:green", "tab:purple", "tab:red"]):
+    simp = sample_runs[("policy", alpha)]
+    simb = sample_runs[("baseline", alpha)]
+
+    mask_p = (pd.to_datetime(simp[DATETIME_COL]) >= sample_start) & (pd.to_datetime(simp[DATETIME_COL]) < sample_end)
+    mask_b = (pd.to_datetime(simb[DATETIME_COL]) >= sample_start) & (pd.to_datetime(simb[DATETIME_COL]) < sample_end)
+
+    axes[3].plot(
+        pd.to_datetime(simp.loc[mask_p, DATETIME_COL]),
+        simp.loc[mask_p, "E_hvac_kwh"],
+        color=color,
+        label=f"E_hvac RL α={alpha}"
+    )
+    axes[3].plot(
+        pd.to_datetime(simb.loc[mask_b, DATETIME_COL]),
+        simb.loc[mask_b, "E_hvac_kwh"],
+        linestyle="--",
+        color=color,
+        alpha=0.5,
+        label=f"E_hvac baseline α={alpha}"
+    )
+
+axes[3].set_ylabel("HVAC Energy (kWh)")
+axes[3].setTitle = "HVAC energy usage"
+axes[3].set_title("HVAC energy usage")
+handles, labels = axes[3].get_legend_handles_labels()
+by_label = dict(zip(labels, handles))
+axes[3].legend(by_label.values(), by_label.keys(), fontsize=8, ncol=2)
+axes[3].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+
+# Extra debug
+for alpha in DEBUG_ALPHAS:
+    sim_dbg = sample_runs[("policy", alpha)]
+    print(f"\nalpha={alpha}")
+    print(sim_dbg["action_delta_schedule"].describe())
+    print("boundary ratio:", (np.abs(sim_dbg["action_delta_schedule"]) > 0.95 * ACTION_MAX_DELTA).mean())
+    print("mean power_frac:", sim_dbg["power_frac"].mean())
+    print("mean hourly cost:", sim_dbg["hourly_cost"].mean())
+    print("mean abs T_dev:", sim_dbg["T_dev"].abs().mean())
+
+
+# Final highlight
+print("\n===== SUMMARY TABLE =====")
+print(summary_df.round(3).to_string(index=False))
+
+best_cost_alpha = summary_df.loc[summary_df["CSF_%"].idxmax(), "alpha"]
+best_balance_alpha = summary_df.loc[(summary_df["CSF_%"] - summary_df["TIF_%"].abs()).idxmax(), "alpha"]
+
+print("\nBest alpha for cost saving:", best_cost_alpha)
+print("Best alpha for cost-comfort balance:", best_balance_alpha)
